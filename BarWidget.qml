@@ -2,301 +2,82 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
-// One system statistic (CPU, GPU, RAM or disk) drawn as an icon plus values.
-//
-// Everything is read straight from /proc and /sys inside the shell process, so
-// a refresh costs a few file reads instead of a bash + awk pipeline. Only the
-// disk stat (df) and NVIDIA GPUs (nvidia-smi) spawn a process, because neither
-// figure is exposed as a file.
-//
-// Left-click cycles the view: all values -> first value only -> icon only.
-// The choice is shared by every screen and survives restarts (ViewState).
-// Right/middle click run the onRightClick / onMiddleClick commands.
 BarWidget {
   id: root
-  moduleName: "amedela.simple-sysstats"
-
-  readonly property var defaultIcons: ({
-    cpu: String.fromCodePoint(0xf4bc),
-    gpu: String.fromCodePoint(0xf08ae),
-    ram: String.fromCodePoint(0xe266),
-    disk: String.fromCodePoint(0xf02ca)
-  })
-
-  readonly property string stat: {
-    var s = String(setting("stat", "CPU")).toLowerCase()
-    return defaultIcons[s] !== undefined ? s : "cpu"
+  moduleName: "maks.sysstats-graph"
+  property var snapshot: ({})
+  property bool popupOpen: false
+  property double now: Date.now()
+  readonly property var metrics: [
+    {id:"cpu", title:"Процессор", icon:String.fromCodePoint(0xf4bc)},
+    {id:"ram", title:"Оперативная память", icon:String.fromCodePoint(0xe266)},
+    {id:"gpu", title:"Видеокарта", icon:String.fromCodePoint(0xf08ae)},
+    {id:"vram", title:"Видеопамять", icon:String.fromCodePoint(0xe266)},
+    {id:"cpu_temp", title:"Температура CPU", icon:String.fromCodePoint(0xf050f)},
+    {id:"gpu_temp", title:"Температура GPU", icon:String.fromCodePoint(0xf050f)},
+    {id:"disk", title:"Диск", icon:String.fromCodePoint(0xf02ca)},
+    {id:"net", title:"Сеть", icon:String.fromCodePoint(0xf0920)}
+  ]
+  readonly property var available: metrics.filter(function(m) { return root.snapshot.capabilities && root.snapshot.capabilities[m.id] })
+  readonly property var metric: {
+    for (var i=0; i<metrics.length; i++) if (metrics[i].id === ViewState.selected) return metrics[i]
+    return metrics[0]
   }
-  readonly property string mount: String(setting("mount", "/")) || "/"
-  readonly property string stateKey: stat === "disk" ? "disk:" + mount : stat
-  readonly property int interval: positive(setting("interval", 0), stat === "disk" ? 30 : 3)
-  readonly property bool showTemperature: setting("showTemperature", true) !== false
-  readonly property int usageThreshold: positive(setting("usageThreshold", 0), 90)
-  readonly property int temperatureThreshold: positive(setting("temperatureThreshold", 0), 85)
-  readonly property real fontSize: positive(setting("fontSize", 0), Style.font.body + 2)
-  readonly property real iconSize: positive(setting("iconSize", 0), Math.round(fontSize * (stat === "gpu" ? 1.8 : 1.07)))
-  readonly property string icon: String(setting("icon", "")) || defaultIcons[stat]
-
-  // 0 = all values, 1 = first value only, 2 = icon only.
-  readonly property int viewMode: ViewState.modes[stateKey] !== undefined
-    ? ViewState.modes[stateKey] : Number(setting("viewMode", 0))
-
-  property var values: []
-  property string tooltipText: ""
-  property bool critical: false
-
-  // Sensor paths found once at startup by the discovery process.
-  property bool discovered: false
-  property string cpuTempPath: ""
-  property string gpuVendor: ""
-  property string gpuDevice: ""
-  property string gpuTempPath: ""
-  property var lastCpu: null
-
-  readonly property color fg: critical && bar ? bar.urgent : (bar ? bar.barForeground : Color.foreground)
-  readonly property var shownValues: viewMode === 2 ? [] : (viewMode === 1 || vertical ? values.slice(0, 1) : values)
-
+  readonly property var latest: snapshot.latest || ({})
+  readonly property var details: snapshot.details || ({})
+  readonly property bool fresh: Boolean(snapshot.updatedAt) && now - snapshot.updatedAt < 15000
+  readonly property bool hovered: button.tooltipHovered || popup.containsMouse
+  readonly property color fg: bar ? bar.barForeground : Commons.Color.foreground
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
-
-  function positive(value, fallback) {
-    var n = Number(value)
-    return isFinite(n) && n > 0 ? n : fallback
+  function valid(v) { return v !== null && v !== undefined && isFinite(Number(v)) }
+  function percent(v) { return valid(v) && fresh ? Math.round(v) + "%" : "—" }
+  function temp(v) { return valid(v) && fresh ? Math.round(v) + "°C" : "—" }
+  function bytes(v) {
+    if (!valid(v)) return "—"
+    var units=["Б", "КБ", "МБ", "ГБ", "ТБ"], n=Number(v), i=0
+    while (n>=1024 && i<units.length-1) {n/=1024; i++}
+    return (i===0 ? n.toFixed(0) : n.toFixed(n<10 ? 1 : 0)) + " " + units[i]
   }
-
-  function gib(bytes) {
-    var v = bytes / 1073741824
-    return v >= 100 ? v.toFixed(0) : v.toFixed(1)
+  function rate(v) { return bytes(v) + "/с" }
+  function value(id) {
+    if (id === "net") return fresh ? "↓ " + rate(latest.net_rx) + "   ↑ " + rate(latest.net_tx) : "—"
+    if (id === "cpu_temp" || id === "gpu_temp") return temp(latest[id])
+    return percent(latest[id])
   }
-
-  function readInt(view) {
-    view.reload()
-    var n = parseInt(view.text(), 10)
-    return isNaN(n) ? null : n
+  function secondary(id) {
+    if (id === "cpu" && valid(latest.cpu_temp)) return temp(latest.cpu_temp)
+    if (id === "gpu" && valid(latest.gpu_temp)) return temp(latest.gpu_temp)
+    if (id === "ram" && valid(details.ramUsed)) return bytes(details.ramUsed) + " / " + bytes(details.ramTotal)
+    if (id === "vram" && valid(details.vramUsed)) return bytes(details.vramUsed) + " / " + bytes(details.vramTotal)
+    if (id === "disk" && valid(details.diskUsed)) return bytes(details.diskUsed) + " / " + bytes(details.diskTotal)
+    return ""
   }
-
-  function publish(values, tooltip, critical) {
-    root.values = values
-    root.tooltipText = tooltip
-    root.critical = critical
+  function cycle() {
+    if (!available.length) return
+    var index = -1
+    for (var i=0; i<available.length; i++) if (available[i].id === metric.id) index=i
+    ViewState.select(available[(index+1)%available.length].id)
   }
-
-  function cycleView() {
-    ViewState.setMode(stateKey, (viewMode + 1) % 3)
+  function close() { popupOpen=false }
+  onHoveredChanged: {
+    if (hovered) { hideTimer.stop(); if (!popupOpen) showTimer.restart() }
+    else { showTimer.stop(); hideTimer.restart() }
   }
-
-  function refresh() {
-    if (stat === "cpu") sampleCpu()
-    else if (stat === "ram") sampleRam()
-    else if (stat === "disk") { if (!dfProc.running) dfProc.running = true }
-    else if (stat === "gpu") sampleGpu()
+  Timer { id: showTimer; interval: 130; onTriggered: root.popupOpen=true }
+  Timer { id: hideTimer; interval: 220; onTriggered: if (!root.hovered) root.popupOpen=false }
+  Timer { interval: 1000; running: true; repeat: true; onTriggered: root.now=Date.now() }
+  FileView {
+    id: dataFile
+    path: Quickshell.env("XDG_RUNTIME_DIR") + "/maks-sysstats-graph.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: { try { root.snapshot=JSON.parse(text()); root.now=Date.now() } catch(e) {} }
   }
-
-  // /proc/stat: "cpu user nice system idle iowait irq softirq steal ..."
-  function sampleCpu() {
-    procStat.reload()
-    var f = procStat.text().split("\n")[0].trim().split(/\s+/).slice(1, 9).map(Number)
-    var idle = f[3] + (f[4] || 0)
-    var total = 0
-    for (var i = 0; i < f.length; i++) total += f[i] || 0
-    var prev = lastCpu
-    lastCpu = { total: total, idle: idle }
-    if (!prev) { warmup.restart(); return }
-
-    var dt = total - prev.total
-    var usage = dt > 0 ? Math.round(100 * (dt - (idle - prev.idle)) / dt) : 0
-    var temp = showTemperature && cpuTempPath ? readInt(cpuTemp) : null
-    if (temp !== null) temp = Math.round(temp / 1000)
-
-    loadAvg.reload()
-    var load = loadAvg.text().trim().split(/\s+/).slice(0, 3).join("  ")
-
-    var vals = [usage + "%"]
-    var tip = ["CPU usage: " + usage + "%"]
-    if (temp !== null) { vals.push(temp + "°C"); tip.push("CPU temp: " + temp + "°C") }
-    tip.push("Load average: " + load)
-    publish(vals, tip.join("\n"), usage >= usageThreshold || (temp !== null && temp >= temperatureThreshold))
-  }
-
-  function sampleRam() {
-    memInfo.reload()
-    var m = {}
-    var lines = memInfo.text().split("\n")
-    for (var i = 0; i < lines.length; i++) {
-      var match = /^(\w+):\s+(\d+)/.exec(lines[i])
-      if (match) m[match[1]] = Number(match[2]) * 1024
-    }
-    if (!m.MemTotal) return
-    var used = m.MemTotal - (m.MemAvailable !== undefined ? m.MemAvailable : m.MemFree)
-    var usage = Math.round(100 * used / m.MemTotal)
-    var tip = ["RAM usage: " + usage + "%", "Used: " + gib(used) + " / " + gib(m.MemTotal) + " GiB"]
-    if (m.SwapTotal > 0) tip.push("Swap: " + gib(m.SwapTotal - m.SwapFree) + " / " + gib(m.SwapTotal) + " GiB")
-    publish([usage + "%", gib(used) + "G"], tip.join("\n"), usage >= usageThreshold)
-  }
-
-  function parseDf(text) {
-    var lines = String(text || "").trim().split("\n")
-    var f = lines[lines.length - 1].trim().split(/\s+/).map(Number)
-    if (f.length < 3 || isNaN(f[0])) {
-      publish(["N/A"], "Disk: cannot read " + mount, false)
-      return
-    }
-    var size = f[0], used = f[1], avail = f[2]
-    var usage = used + avail > 0 ? Math.round(100 * used / (used + avail)) : 0
-    publish([usage + "%", gib(used) + "G"],
-      "Disk (" + mount + ") usage: " + usage + "%\nUsed: " + gib(used) + " / " + gib(size)
-        + " GiB\nFree: " + gib(avail) + " GiB",
-      usage >= usageThreshold)
-  }
-
-  function sampleGpu() {
-    if (gpuVendor === "amd") {
-      var usage = readInt(gpuBusy)
-      if (usage === null) return
-      var temp = showTemperature && gpuTempPath ? readInt(gpuTemp) : null
-      if (temp !== null) temp = Math.round(temp / 1000)
-      var vramUsed = readInt(gpuVramUsed)
-      var vramTotal = readInt(gpuVramTotal)
-      gpuReport(usage, temp, vramUsed, vramTotal)
-    } else if (gpuVendor === "nvidia") {
-      if (!nvidiaProc.running) nvidiaProc.running = true
-    } else {
-      publish(["N/A"], gpuVendor === "intel"
-        ? "GPU usage is not exposed by the Intel driver"
-        : "No supported GPU found (AMD via sysfs, NVIDIA via nvidia-smi)", false)
-    }
-  }
-
-  function gpuReport(usage, temp, vramUsed, vramTotal) {
-    var vals = [usage + "%"]
-    var tip = ["GPU usage: " + usage + "%"]
-    if (temp !== null) { vals.push(temp + "°C"); tip.push("GPU temp: " + temp + "°C") }
-    if (vramUsed !== null && vramTotal) tip.push("VRAM: " + gib(vramUsed) + " / " + gib(vramTotal) + " GiB")
-    publish(vals, tip.join("\n"), usage >= usageThreshold || (temp !== null && temp >= temperatureThreshold))
-  }
-
-  // nvidia-smi CSV: utilization, temperature, memory.used, memory.total (MiB)
-  function parseNvidia(text) {
-    var f = String(text || "").trim().split("\n")[0].split(",").map(function(s) { return parseInt(s, 10) })
-    if (f.length < 4 || isNaN(f[0])) { publish(["N/A"], "nvidia-smi returned no data", false); return }
-    gpuReport(f[0], showTemperature && !isNaN(f[1]) ? f[1] : null, f[2] * 1048576, f[3] * 1048576)
-  }
-
-  // Discovery output, one "kind priority value..." record per line.
-  function applyDiscovery(text) {
-    var cpu = null, gpu = null
-    var pinned = String(setting("gpuCard", ""))
-    var vendorRank = { nvidia: 3, amd: 2, intel: 1 }
-    var lines = String(text || "").split("\n")
-    for (var i = 0; i < lines.length; i++) {
-      var f = lines[i].trim().split(/\s+/)
-      if (f[0] === "cpu" && f.length >= 3) {
-        var prio = Number(f[1])
-        if (!cpu || prio < cpu.prio) cpu = { prio: prio, path: f[2] }
-      } else if (f[0] === "gpu" && f.length >= 6) {
-        var g = { card: f[1], vendor: f[2], vram: Number(f[3]) || 0, device: f[4], temp: f[5] === "-" ? "" : f[5] }
-        if (pinned) { if (g.card === pinned) gpu = g; continue }
-        if (!gpu || vendorRank[g.vendor] > vendorRank[gpu.vendor]
-            || (g.vendor === gpu.vendor && g.vram > gpu.vram)) gpu = g
-      }
-    }
-    cpuTempPath = cpu ? cpu.path : ""
-    if (gpu) {
-      gpuVendor = gpu.vendor
-      gpuDevice = gpu.device
-      gpuTempPath = gpu.temp
-    }
-    discovered = true
-  }
-
-  FileView { id: procStat; path: "/proc/stat"; blockLoading: true; printErrors: false }
-  FileView { id: loadAvg; path: "/proc/loadavg"; blockLoading: true; printErrors: false }
-  FileView { id: memInfo; path: "/proc/meminfo"; blockLoading: true; printErrors: false }
-  FileView { id: cpuTemp; path: root.cpuTempPath; blockLoading: true; printErrors: false }
-  FileView { id: gpuBusy; path: root.gpuVendor === "amd" ? root.gpuDevice + "/gpu_busy_percent" : ""; blockLoading: true; printErrors: false }
-  FileView { id: gpuVramUsed; path: root.gpuVendor === "amd" ? root.gpuDevice + "/mem_info_vram_used" : ""; blockLoading: true; printErrors: false }
-  FileView { id: gpuVramTotal; path: root.gpuVendor === "amd" ? root.gpuDevice + "/mem_info_vram_total" : ""; blockLoading: true; printErrors: false }
-  FileView { id: gpuTemp; path: root.gpuTempPath; blockLoading: true; printErrors: false }
-
-  // Runs once. Lists CPU temperature sensors (lower priority wins) and GPUs.
-  Process {
-    id: discoveryProc
-    running: root.stat === "cpu" || root.stat === "gpu"
-    command: ["sh", "-c", `
-      for h in /sys/class/hwmon/hwmon*; do
-        name=$(cat "$h/name" 2>/dev/null)
-        case "$name" in
-          k10temp|zenpower) echo "cpu 1 $h/temp1_input" ;;
-          coretemp)
-            p="$h/temp1_input"
-            for l in "$h"/temp*_label; do
-              case "$(cat "$l" 2>/dev/null)" in "Package id 0") p="\${l%_label}_input" ;; esac
-            done
-            echo "cpu 1 $p" ;;
-          cpu_thermal|soc_thermal) echo "cpu 3 $h/temp1_input" ;;
-          acpitz) echo "cpu 8 $h/temp1_input" ;;
-        esac
-      done
-      for z in /sys/class/thermal/thermal_zone*; do
-        [ "$(cat "$z/type" 2>/dev/null)" = x86_pkg_temp ] && echo "cpu 2 $z/temp"
-      done
-      for c in /sys/class/drm/card*; do
-        case "\${c##*/}" in *-*) continue ;; esac
-        d=$(readlink -f "$c/device")
-        t=$(ls -d "$d"/hwmon/hwmon*/temp1_input 2>/dev/null | head -n1)
-        case "$(cat "$d/vendor" 2>/dev/null)" in
-          0x1002) [ -r "$d/gpu_busy_percent" ] && echo "gpu \${c##*/} amd $(cat "$d/mem_info_vram_total" 2>/dev/null || echo 0) $d \${t:--}" ;;
-          0x10de) command -v nvidia-smi >/dev/null && echo "gpu \${c##*/} nvidia 0 $d -" ;;
-          0x8086) echo "gpu \${c##*/} intel 0 $d -" ;;
-        esac
-      done
-      true
-    `]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.applyDiscovery(text)
-    }
-  }
-
-  Process {
-    id: dfProc
-    command: ["df", "-B1", "--output=size,used,avail", root.mount]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.parseDf(text)
-    }
-  }
-
-  Process {
-    id: nvidiaProc
-    command: ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total",
-      "--format=csv,noheader,nounits", "--id=0"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.parseNvidia(text)
-    }
-  }
-
-  Timer {
-    interval: root.interval * 1000
-    running: root.discovered || root.stat === "ram" || root.stat === "disk"
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.refresh()
-  }
-
-  // CPU usage is a delta between two samples; take the second one quickly so
-  // the widget does not sit empty for a full interval after startup.
-  Timer {
-    id: warmup
-    interval: 500
-    onTriggered: root.sampleCpu()
-  }
-
-  // WidgetButton is the bar's hover/click surface: the bar overlays each slot
-  // with its own pointer area and only forwards presses and tooltips to it.
   WidgetButton {
     id: button
     anchors.fill: parent
@@ -304,100 +85,80 @@ BarWidget {
     labelVisible: false
     hasVisualContent: true
     fixedWidth: root.vertical ? -1 : row.implicitWidth + 15
-    fixedHeight: root.vertical ? column.implicitHeight + 12 : -1
-    tooltipText: root.tooltipText
+    fixedHeight: root.vertical ? row.implicitHeight + 12 : -1
+    tooltipText: ""
     onPressed: function(mouseButton) {
-      if (mouseButton === Qt.LeftButton) { root.cycleView(); return }
-      var right = mouseButton === Qt.RightButton
-      var cmd = String(root.setting(right ? "onRightClick" : "onMiddleClick",
-        right ? "omarchy-launch-or-focus-tui btop" : ""))
-      if (root.bar && cmd) root.bar.run(cmd)
+      if (mouseButton === Qt.LeftButton) root.cycle()
+      else if (mouseButton === Qt.RightButton && root.bar) root.bar.run("omarchy-launch-or-focus-tui btop")
     }
-
     Row {
       id: row
-      visible: !root.vertical
       anchors.centerIn: parent
-      spacing: 5
-
-      Text {
-        anchors.verticalCenter: parent.verticalCenter
-        text: root.icon
-        color: root.fg
-        font.family: root.bar ? root.bar.fontFamily : Style.font.family
-        font.pixelSize: root.iconSize
-        renderType: Text.NativeRendering
-      }
-
-      // Values are drawn as separate pieces with a thin rule between them, so
-      // the gap around the separator is not a full monospace space.
+      spacing: 6
+      Text { text: root.metric.icon; color:root.fg; font.family:root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize:Style.font.body+3; anchors.verticalCenter:parent.verticalCenter; renderType:Text.NativeRendering }
+      Text { text:root.value(root.metric.id) + ((root.metric.id === "cpu" || root.metric.id === "gpu") && root.secondary(root.metric.id) ? " | " + root.secondary(root.metric.id) : ""); color:root.fg; font.family:root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize:Style.font.body+2; anchors.verticalCenter:parent.verticalCenter; renderType:Text.NativeRendering }
+    }
+  }
+  PopupCard {
+    id: popup
+    anchorItem: root
+    bar: root.bar
+    owner: root
+    triggerMode: "hover"
+    open: root.popupOpen
+    contentWidth: fittedContentWidth(330)
+    contentHeight: fittedContentHeight(content.implicitHeight)
+    Column {
+      id: content
+      width: parent.width
+      spacing: 8
       Row {
-        anchors.verticalCenter: parent.verticalCenter
-        spacing: Number(root.setting("separatorGap", 4))
-
-        Repeater {
-          model: {
-            var out = []
-            for (var i = 0; i < root.shownValues.length; i++) {
-              if (i > 0) out.push("|")
-              out.push(root.shownValues[i])
-            }
-            return out
+        width: parent.width
+        spacing: 8
+        Text { text:root.metric.icon; color:Commons.Color.accent; font.family:root.bar ? root.bar.fontFamily : Style.font.family; font.pixelSize:20; anchors.verticalCenter:parent.verticalCenter }
+        Text { text:root.metric.title; color:root.bar ? root.bar.foreground : Commons.Color.foreground; font.family:Style.font.family; font.pixelSize:15; font.bold:true; anchors.verticalCenter:parent.verticalCenter }
+      }
+      Row {
+        width: parent.width
+        spacing: 10
+        Text { text:root.value(root.metric.id); color:root.bar ? root.bar.foreground : Commons.Color.foreground; font.family:Style.font.family; font.pixelSize:20; font.bold:true; anchors.verticalCenter:parent.verticalCenter }
+        Text { text:root.secondary(root.metric.id); color:root.bar ? root.bar.foreground : Commons.Color.foreground; opacity:0.65; font.family:Style.font.family; font.pixelSize:11; anchors.verticalCenter:parent.verticalCenter }
+      }
+      Canvas {
+        id: chart
+        width: parent.width
+        height: 100
+        property var snapshotData: root.snapshot
+        property string selected: root.metric.id
+        onSnapshotDataChanged: if (root.popupOpen) requestPaint()
+        onSelectedChanged: requestPaint()
+        Connections { target: root; function onPopupOpenChanged() { if (root.popupOpen) chart.requestPaint() } }
+        onPaint: {
+          var ctx=getContext("2d"); ctx.clearRect(0,0,width,height)
+          var history=(snapshotData && snapshotData.history) || {}, keys=selected === "net" ? ["net_rx","net_tx"] : [selected]
+          var series=keys.map(function(k){return history[k] || []})
+          var end=Date.now(), oldest=end, maxValue=0
+          for (var s=0;s<series.length;s++) for(var i=0;i<series[s].length;i++) {
+            var p=series[s][i]; if(p && p.length>=2 && p[1]!==null && isFinite(p[1])) {oldest=Math.min(oldest,p[0]); maxValue=Math.max(maxValue,p[1])}
           }
-
-          Item {
-            readonly property bool isSep: modelData === "|"
-            anchors.verticalCenter: parent.verticalCenter
-            implicitWidth: isSep ? 1 : piece.implicitWidth
-            implicitHeight: piece.implicitHeight
-
-            Rectangle {
-              visible: parent.isSep
-              anchors.centerIn: parent
-              width: 1
-              height: Math.round(root.fontSize * 0.85)
-              color: root.fg
-              opacity: 0.5
+          var span=60000, start=end-span
+          var maxY=selected === "net" ? Math.max(1,maxValue*1.2) : (selected.indexOf("temp")>=0 ? Math.max(100,Math.ceil(maxValue/10)*10) : 100)
+          ctx.lineWidth=1; ctx.strokeStyle=Qt.rgba(0.5,0.5,0.5,0.22)
+          for(var g=0;g<=4;g++){var y=1+(height-2)*g/4;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(width,y);ctx.stroke()}
+          for(var j=0;j<series.length;j++) {
+            var points=series[j], active=false, last=0
+            ctx.beginPath(); ctx.lineWidth=2; ctx.strokeStyle=j===0 ? Commons.Color.accent : (root.bar ? root.bar.foreground : Commons.Color.foreground)
+            for(var k=0;k<points.length;k++) {
+              var q=points[k]; if(!q || q[1]===null || !isFinite(q[1]) || q[0]<start || q[0]>end) {active=false;continue}
+              var x=(q[0]-start)/span*width, yy=height-2-Math.max(0,Math.min(1,q[1]/maxY))*(height-4)
+              if(!active || q[0]-last>3500) ctx.moveTo(x,yy); else ctx.lineTo(x,yy)
+              active=true;last=q[0]
             }
-
-            Text {
-              id: piece
-              visible: !parent.isSep
-              text: parent.isSep ? " " : modelData
-              color: root.fg
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
-              font.pixelSize: root.fontSize
-              renderType: Text.NativeRendering
-            }
+            ctx.stroke()
           }
         }
       }
-    }
 
-    Column {
-      id: column
-      visible: root.vertical
-      anchors.centerIn: parent
-      spacing: 2
-
-      Text {
-        anchors.horizontalCenter: parent.horizontalCenter
-        text: root.icon
-        color: root.fg
-        font.family: root.bar ? root.bar.fontFamily : Style.font.family
-        font.pixelSize: root.iconSize
-        renderType: Text.NativeRendering
-      }
-
-      Text {
-        anchors.horizontalCenter: parent.horizontalCenter
-        visible: root.shownValues.length > 0
-        text: root.shownValues.length > 0 ? root.shownValues[0] : ""
-        color: root.fg
-        font.family: root.bar ? root.bar.fontFamily : Style.font.family
-        font.pixelSize: Math.round(root.fontSize * 0.85)
-        renderType: Text.NativeRendering
-      }
     }
   }
 }

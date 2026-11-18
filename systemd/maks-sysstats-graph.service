@@ -1,0 +1,11 @@
+[Unit]
+Description=Continuous system statistics for the Omarchy graph widget
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.config/omarchy/plugins/maks.sysstats-graph/sampler.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=default.target

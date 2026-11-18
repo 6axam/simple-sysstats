@@ -1,72 +1,87 @@
-# Simple sysstats for Omarchy
+# Системные графики для Omarchy
 
-CPU, GPU, RAM and disk usage (with CPU/GPU temperatures) for the Omarchy bar.
+Пользовательский форк [AlexMedela/simple-sysstats](https://github.com/AlexMedela/simple-sysstats).
+Идентификатор плагина: `maks.sysstats-graph`. Он отличается от исходного `amedela.simple-sysstats`, поэтому обе версии могут быть установлены одновременно.
 
-![Simple sysstats in the Omarchy bar](preview.png)
+Виджет показывает системные показатели и график за последние 60 секунд во всплывающей карточке. Данные собирает отдельный пользовательский процесс Python раз в секунду — история продолжается, пока карточка закрыта.
 
-Hover any stat for details:
+## Возможности
 
-| CPU | GPU |
-|---|---|
-| ![CPU tooltip](screenshots/tooltip-cpu.png) | ![GPU tooltip](screenshots/tooltip-gpu.png) |
-| **RAM** | **Disk** |
-| ![RAM tooltip](screenshots/tooltip-ram.png) | ![Disk tooltip](screenshots/tooltip-disk.png) |
+- Загрузка CPU, RAM, GPU и VRAM; температуры CPU/GPU; заполнение корневого диска; приём и отправка по сети.
+- ЛКМ переключает доступные показатели; наведение открывает график; ПКМ запускает `btop`.
+- Выбранный показатель сохраняется; история записывается каждые 30 секунд и при штатной остановке сборщика.
+- Недоступные датчики не подменяются выдуманными значениями. Устаревшие данные отображаются как `—`.
+- Цвета и шрифт наследуются от темы Omarchy. Сборщик работает без root и сторонних Python-библиотек.
 
-- **Lightweight.** CPU, RAM, temperatures and AMD GPU figures are read straight from `/proc` and `/sys` inside the shell, with no scripts or subprocesses on each refresh. Only disk usage (`df`) and NVIDIA GPUs (`nvidia-smi`) run a command.
-- **Hardware detection.** CPU temperature from `k10temp`/`zenpower` (AMD), `coretemp` (Intel), `x86_pkg_temp`, `cpu_thermal` (ARM) or `acpitz`. GPU from AMD sysfs or `nvidia-smi`; the discrete GPU is picked automatically.
-- **Three views.** Left-click cycles between all values, first value only and icon only. The choice is shared across monitors and kept across restarts.
-- **Warnings.** The widget turns the theme's urgent colour at 90% usage or 85 °C (configurable).
-- Hover for details (load average, swap, VRAM, free space). Right-click opens `btop`.
+## Требования и поддержка оборудования
 
-## Install
+Нужны Omarchy с плагинами Quickshell, Python 3.10+ и пользовательская сессия systemd. `btop` нужен только для действия по ПКМ.
+
+| Показатель | Источник и ограничения |
+| --- | --- |
+| CPU | `/proc/stat`, разность счётчиков |
+| RAM | `/proc/meminfo`, `MemTotal - MemAvailable` |
+| GPU / VRAM | AMD `amdgpu`, доступные счётчики sysfs |
+| Температура CPU | AMD `k10temp` |
+| Температура GPU | AMD `amdgpu` hwmon |
+| Диск | Заполнение файловой системы `/`, не скорость дисковых операций |
+| Сеть | Сумма счётчиков физических интерфейсов; VPN и loopback исключены |
+
+Загрузка Intel/NVIDIA GPU в этой версии не поддерживается. Сборщик намеренно не вызывает `nvidia-smi`, чтобы не будить спящую видеокарту. При нескольких GPU используется первая обнаруженная DRM-карта; выбор карты пока не настраивается. Исходный плагин имеет другой набор настроек и поддержку NVIDIA — [его описание сохранено отдельно](docs/UPSTREAM.md).
+
+## Установка на новый компьютер
+
+Установка плагина не запускает сборщик автоматически. Выполни оба шага:
 
 ```bash
-omarchy plugin add https://github.com/AlexMedela/simple-sysstats.git --enable
+omarchy plugin add https://github.com/6axam/simple-sysstats.git --enable
+bash ~/.config/omarchy/plugins/maks.sysstats-graph/scripts/setup-sampler.sh
 ```
 
-The widget is added once, showing CPU. Add it again for each stat you want and set its `stat` in the bar settings panel or in `~/.config/omarchy/shell.json`:
+Скрипт устанавливает только пользовательский systemd-сервис, сохраняет копию прежнего unit-файла и запускает сборщик. `sudo` не нужен. Сервис использует `%h`, поэтому в репозитории нет пути к домашней папке конкретного пользователя.
+
+Пример записи виджета в `~/.config/omarchy/shell.json`:
 
 ```json
-"right": [
-  { "id": "amedela.simple-sysstats", "stat": "CPU" },
-  { "id": "amedela.simple-sysstats", "stat": "GPU" },
-  { "id": "amedela.simple-sysstats", "stat": "RAM" },
-  { "id": "amedela.simple-sysstats", "stat": "Disk", "mount": "/" }
-]
+{ "id": "maks.sysstats-graph" }
 ```
 
-## Settings
+Добавь запись в нужную секцию `bar.layout` через настройки панели, если виджет ещё не появился.
 
-| Key | Default | Description |
-|---|---|---|
-| `stat` | `CPU` | `CPU`, `GPU`, `RAM` or `Disk` |
-| `interval` | `3` (`30` for disk) | Refresh interval in seconds |
-| `showTemperature` | `true` | Show CPU/GPU temperature |
-| `mount` | `/` | Disk only: filesystem to report |
-| `gpuCard` | auto | GPU only: pin a DRM card, e.g. `card1` |
-| `usageThreshold` | `90` | Usage (%) that triggers the warning colour |
-| `temperatureThreshold` | `85` | Temperature (°C) that triggers the warning colour |
-| `onRightClick` | `omarchy-launch-or-focus-tui btop` | Command on right-click |
-| `onMiddleClick` | — | Command on middle-click |
-| `icon`, `iconSize`, `fontSize` | auto | Override the Nerd Font glyph and sizes |
-| `viewMode` | `0` | Starting view: `0` all values, `1` first value, `2` icon only |
+## Если эта локальная версия уже установлена
 
-## Hardware support
+Сначала сохрани свою папку `~/.config/omarchy/plugins/maks.sysstats-graph`. Команда `omarchy plugin add` может отказаться заменять существующую локальную папку без git. Не удаляй её без резервной копии. Уже работающий сервис продолжит использовать текущую локальную версию; публикация форка сама по себе её не обновляет.
 
-| | Usage | Temperature |
-|---|---|---|
-| AMD CPU | ✅ | ✅ `k10temp` / `zenpower` |
-| Intel CPU | ✅ | ✅ `coretemp` |
-| AMD GPU (amdgpu) | ✅ | ✅ |
-| NVIDIA GPU | ✅ needs `nvidia-smi` (proprietary driver) | ✅ |
-| Intel GPU | ❌ not exposed by the driver (shows N/A) | — |
-
-## Uninstall
+## Проверка и обслуживание
 
 ```bash
-omarchy plugin remove amedela.simple-sysstats
+systemctl --user status maks-sysstats-graph.service
+journalctl --user -u maks-sysstats-graph.service -n 30
 ```
 
-## License
+Файлы состояния (с учётом переменных XDG):
 
-MIT
+- `$XDG_RUNTIME_DIR/maks-sysstats-graph.json` — текущие показатели.
+- `${XDG_STATE_HOME:-~/.local/state}/omarchy/maks-sysstats-history.json` — история.
+- `${XDG_STATE_HOME:-~/.local/state}/omarchy/maks.sysstats-graph.json` — выбранный показатель.
+
+После перерыва более минуты старая история отбрасывается. Сборщик использует приватные права на файлы состояния.
+
+## Удаление
+
+Сначала останови сборщик, затем удали плагин:
+
+```bash
+systemctl --user disable --now maks-sysstats-graph.service
+rm ~/.config/systemd/user/maks-sysstats-graph.service
+systemctl --user daemon-reload
+omarchy plugin remove maks.sysstats-graph
+```
+
+Файлы истории остаются в локальном каталоге состояния и могут быть удалены отдельно.
+
+## Происхождение и лицензия
+
+Исходный проект: [Simple sysstats](https://github.com/AlexMedela/simple-sysstats), автор AlexMedela. История исходного репозитория и MIT-лицензия сохранены. Этот форк добавляет графики, отдельный сборщик данных, историю и сетевые показатели. Иллюстрации `preview.png` и `screenshots/` относятся к исходной версии, а не к графическому интерфейсу этого форка.
+
+Лицензия: [MIT](LICENSE).
